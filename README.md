@@ -6,8 +6,8 @@ A Rust and GTK4 desktop manager for **dinit and runit**, formerly Dinkit. Inspir
 - Start, stop, restart, enable, disable, reload, unpin, signal, ad hoc add-dep/rm-dep, and (user scope) create/delete service definitions and set/unset the activation environment.
 - A Dependencies view shows both what a service depends on and what depends on it.
 - Detailed status and buffered logs in a dedicated console panel.
-- An auto-refresh toggle keeps the list current on its own, updating only the rows that changed.
-- System actions authenticate once through a small, allowlisted polkit helper for the rest of the session.
+- Selecting a service refreshes only that service's row and detail, not the whole list.
+- System actions authenticate once through a small, allowlisted polkit helper for the rest of the session, which drops itself after five minutes idle so a root process never lingers unused.
 - Background command execution keeps the interface responsive.
 
 ## Install

@@ -3,7 +3,12 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 mod runit;
@@ -78,6 +83,24 @@ impl Backend {
         }
     }
 
+    /// Refreshes a single service's live state — for the GUI to update just the row the user
+    /// selected, instead of the whole list. Runit has a real per-service primitive (`sv
+    /// status`) and uses that directly. Dinit's control protocol doesn't: `status`'s free-text
+    /// report doesn't carry `list`'s richer Failed/Skipped/compound-transition states (see
+    /// `parse_list`'s doc comment), so a from-scratch parser would risk showing a different
+    /// state here than a full refresh would — this still goes through `list`/`discover` to stay
+    /// byte-for-byte consistent, it just discards every entry but the one asked for.
+    pub fn service(self, scope: Scope, name: &str) -> Result<Service, String> {
+        match self {
+            Self::Dinit => self
+                .list(scope)?
+                .into_iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| format!("{name}: no longer listed")),
+            Self::Runit => runit::service(scope, name),
+        }
+    }
+
     pub fn request(
         self,
         scope: Scope,
@@ -90,14 +113,14 @@ impl Backend {
                 runit::validate(action, service)?;
                 let args: Vec<&str> = service.into_iter().collect();
                 if scope == Scope::System && action != "status" {
-                    privileged_request(self, action, &args, true)
+                    privileged_request(self, action, &args)
                 } else {
                     runit::request(scope, action, service).or_else(|error| {
                         if scope == Scope::System
                             && action == "status"
                             && error.to_ascii_lowercase().contains("permission denied")
                         {
-                            privileged_request(self, action, &args, true)
+                            privileged_request(self, action, &args)
                         } else {
                             Err(error)
                         }
@@ -350,7 +373,7 @@ fn dispatch(scope: Scope, action: &str, args: &[&str]) -> Result<String, String>
     if scope == Scope::User {
         return output(command_multi(scope, action, args));
     }
-    privileged_request(Backend::Dinit, action, args, true)
+    privileged_request(Backend::Dinit, action, args)
 }
 
 /// Sends an arbitrary signal to a running service's process (`dinitctl signal`).
@@ -458,29 +481,6 @@ pub fn output(mut cmd: Command) -> Result<String, String> {
 }
 
 pub fn request(scope: Scope, action: &str, service: Option<&str>) -> Result<String, String> {
-    request_impl(scope, action, service, true)
-}
-
-/// Like `request`, but for a background/automatic caller (the auto-refresh timer) that must
-/// never trigger an interactive `pkexec` prompt of its own: on System scope, uses an
-/// already-live privileged helper session if one exists, but fails immediately rather than
-/// spawning one. A manual action (the refresh button, any lifecycle button, scope change) should
-/// keep using `request`, which is allowed to prompt — that's the user explicitly asking for
-/// something, not a silent timer tick.
-pub fn request_passive(
-    scope: Scope,
-    action: &str,
-    service: Option<&str>,
-) -> Result<String, String> {
-    request_impl(scope, action, service, false)
-}
-
-fn request_impl(
-    scope: Scope,
-    action: &str,
-    service: Option<&str>,
-    may_spawn: bool,
-) -> Result<String, String> {
     validate(action, service)?;
     if scope == Scope::User {
         return output(command(scope, action, service)?);
@@ -492,7 +492,7 @@ fn request_impl(
         }
     }
     let args: Vec<&str> = service.into_iter().collect();
-    privileged_request(Backend::Dinit, action, &args, may_spawn)
+    privileged_request(Backend::Dinit, action, &args)
 }
 
 /// Shuts down the kept-alive helper session, if one is running. Call on app
@@ -504,8 +504,45 @@ pub fn shutdown_helper() {
 }
 
 // The pkexec helper authenticates once and is then kept alive for the rest of
-// the session (caerus pattern), so later system actions don't re-prompt.
-static HELPER: Mutex<Option<Helper>> = Mutex::new(None);
+// the session (caerus pattern), so later system actions don't re-prompt — but
+// only while actually used. `IDLE_TIMEOUT` (same value and reasoning as
+// caerus's `backend::transaction::IDLE_TIMEOUT`) bounds how long a root
+// process may sit around unused: each request pushes the deadline out, and a
+// dedicated watcher thread per session (`spawn_idle_watcher`) proactively
+// drops the session once it elapses, so the next privileged action
+// re-authenticates instead of riding an indefinitely-lived root process.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+struct HelperSession {
+    helper: Helper,
+    id: u64,
+    deadline: Instant,
+}
+
+static HELPER: Mutex<Option<HelperSession>> = Mutex::new(None);
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Polls once a second for the named session to go idle past `IDLE_TIMEOUT` and drops it when it
+/// does, so an unused root process doesn't linger forever. Exits without acting the moment `id`
+/// is no longer the live session — either a fresher session replaced it (whose own watcher is
+/// now responsible) or the session is already gone (e.g. `shutdown_helper`).
+fn spawn_idle_watcher(id: u64) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(1));
+        let mut guard = HELPER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.as_ref() {
+            Some(session) if session.id == id => {
+                if Instant::now() >= session.deadline {
+                    *guard = None;
+                    return;
+                }
+            }
+            _ => return,
+        }
+    });
+}
 
 enum Fault {
     /// The helper is still alive; the command itself failed.
@@ -610,30 +647,28 @@ fn parse_response_header(header: &str) -> Result<(bool, usize), String> {
     }
 }
 
-/// `may_spawn: false` is for a background/automatic caller that must never trigger an
-/// interactive `pkexec` prompt of its own — it uses an already-live helper session if one
-/// exists, but fails immediately instead of spawning one. The check and the spawn happen under
-/// the same lock acquisition, so there's no window where a concurrent manual request's spawn
-/// decision could race with this one.
-fn privileged_request(
-    backend: Backend,
-    action: &str,
-    args: &[&str],
-    may_spawn: bool,
-) -> Result<String, String> {
+fn privileged_request(backend: Backend, action: &str, args: &[&str]) -> Result<String, String> {
     let mut guard = HELPER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if guard.is_none() {
-        if !may_spawn {
-            return Err(
-                "system service manager session not active (use a manual action to authenticate)"
-                    .into(),
-            );
-        }
-        *guard = Some(Helper::spawn()?);
+    if guard.as_ref().is_some_and(|s| Instant::now() >= s.deadline) {
+        // Idle past IDLE_TIMEOUT; the watcher thread may not have gotten to it yet. Drop it here
+        // too so this call re-authenticates immediately rather than waiting on the watcher's
+        // own 1s poll.
+        *guard = None;
     }
-    match guard.as_mut().unwrap().request(backend, action, args) {
+    if guard.is_none() {
+        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        *guard = Some(HelperSession {
+            helper: Helper::spawn()?,
+            id,
+            deadline: Instant::now() + IDLE_TIMEOUT,
+        });
+        spawn_idle_watcher(id);
+    }
+    let session = guard.as_mut().unwrap();
+    session.deadline = Instant::now() + IDLE_TIMEOUT;
+    match session.helper.request(backend, action, args) {
         Ok(text) => Ok(text),
         Err(Fault::Command(msg)) => Err(msg),
         Err(Fault::Transport(msg)) => {
@@ -1068,6 +1103,13 @@ fn with_buffered_log_type(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guards the two tests below that mutate the process-wide `XDG_CONFIG_HOME` env var:
+    /// `cargo test`'s default thread-per-test runner would otherwise let them interleave and
+    /// stomp on each other's value mid-test (each test genuinely does need the real env var, not
+    /// a fake handed to it, since that's exactly what `user_config_dir()` reads).
+    static XDG_CONFIG_HOME_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn states_and_metadata() {
         let services = parse_list("[{+}     ] sshd (pid: 42)\n{   >>{-}} network\n{     {X}} broken\n{   <<{ }} pending\n{     {-}} stopped\n[{s}     ] skipped\n");
@@ -1210,16 +1252,6 @@ mod tests {
             .execute_system("setenv", &["FOO=bar"])
             .is_err());
         assert!(Backend::Dinit.execute_system("unsetenv", &["FOO"]).is_err());
-    }
-    #[test]
-    fn request_passive_never_spawns_a_privileged_session() {
-        // A fresh test process has no live helper session. request_passive must fail outright
-        // rather than spawn pkexec — a background/automatic caller (the auto-refresh timer)
-        // must never trigger its own interactive authentication prompt.
-        assert!(request_passive(Scope::System, "start", Some("sshd")).is_err());
-        // System `list` typically fails unprivileged (0600 socket) and falls through to the
-        // helper path; with no live session, this must still error rather than spawn.
-        assert!(request_passive(Scope::System, "list", None).is_err());
     }
     #[test]
     fn unsetenv_rejects_empty_or_invalid_names() {
@@ -1401,12 +1433,12 @@ mod tests {
     }
     #[test]
     fn create_enable_target_and_delete_user_service_roundtrip() {
+        let _guard = XDG_CONFIG_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("pilot-lib-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Single test function, start to finish on one thread: no other
-        // test reads or writes XDG_CONFIG_HOME, so there's no data race on
-        // this process-wide env var despite cargo test's default threading.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
 
         let contents = render_service_file("/bin/sleep infinity", true, "boot").unwrap();
@@ -1451,10 +1483,12 @@ mod tests {
     }
     #[test]
     fn enable_buffered_log_rewrites_the_definition_file() {
+        let _guard = XDG_CONFIG_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("pilot-buflog-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Same single-threaded XDG_CONFIG_HOME justification as the roundtrip test above.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
 
         let contents = render_service_file("/bin/sleep infinity", false, "boot").unwrap();

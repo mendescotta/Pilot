@@ -1,16 +1,13 @@
 use gtk::{glib, prelude::*};
 use pilot::{Backend, Scope, Service};
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     rc::Rc,
     time::{Duration, Instant},
 };
 
-/// Seconds between automatic refreshes while auto-refresh is on (not paused).
-const AUTO_REFRESH_SECONDS: u32 = 5;
-
 /// A displayed list row, holding onto the one label whose text/style actually changes
-/// (`state_label`) so `sync_rows` can update it in place instead of rebuilding the row.
+/// (`state_label`) so `apply_service` can update it in place instead of rebuilding the row.
 struct Row {
     service: Service,
     widget: gtk::ListBoxRow,
@@ -27,8 +24,6 @@ struct Ui {
     scope: gtk::DropDown,
     search: gtk::SearchEntry,
     status_filter: gtk::DropDown,
-    auto_refresh: gtk::ToggleButton,
-    countdown: Rc<Cell<u32>>,
     list: gtk::ListBox,
     title: gtk::Label,
     subtitle: gtk::Label,
@@ -184,34 +179,6 @@ impl Ui {
             }
         });
     }
-    /// Ticks once a second: counts down and quietly refreshes the list when it reaches zero,
-    /// skipping a tick entirely while paused (the toggle is inactive) or while a manual job is
-    /// already in flight (`body` is only ever disabled by `job`, never by the quiet refresh, so
-    /// this still correctly detects "a manual action is running" and avoids overlapping it).
-    fn start_auto_refresh(&self) {
-        let ui = self.clone();
-        glib::timeout_add_local(Duration::from_secs(1), move || {
-            if !ui.auto_refresh.is_active() {
-                ui.auto_refresh
-                    .set_tooltip_text(Some("Auto-refresh (paused) — click to resume"));
-                return glib::ControlFlow::Continue;
-            }
-            let remaining = ui.countdown.get();
-            if remaining == 0 {
-                ui.countdown.set(AUTO_REFRESH_SECONDS);
-                if ui.body.is_sensitive() {
-                    ui.refresh_quiet();
-                }
-            } else {
-                ui.countdown.set(remaining - 1);
-            }
-            ui.auto_refresh.set_tooltip_text(Some(&format!(
-                "Auto-refresh ({}s) — click to pause",
-                ui.countdown.get()
-            )));
-            glib::ControlFlow::Continue
-        });
-    }
     /// Rebuilds row widgets from `services` (call when the underlying data
     /// changes). Row visibility is then handed to `filter`, so a search
     /// keystroke never has to tear down and recreate the list.
@@ -307,80 +274,12 @@ impl Ui {
             .unwrap_or(0);
         self.status_filter.set_selected(index as u32);
     }
-    /// Updates existing rows in place when the set of service names hasn't changed (the common
-    /// case for an auto-refresh tick, and the only case this is ever called for — `refresh_impl`
-    /// skips it entirely otherwise): only each changed row's state label (text + css class) and
-    /// tooltip are touched, never the widget tree, so selection, scroll position and hover state
-    /// all survive untouched. Falls back to a full `rebuild()` if services were added or removed.
-    fn sync_rows(&self) {
-        let same_identity = {
-            let services = self.services.borrow();
-            let rows = self.rows.borrow();
-            services.len() == rows.len()
-                && services
-                    .iter()
-                    .zip(rows.iter())
-                    .all(|(s, row)| s.name == row.service.name)
-        };
-        if !same_identity {
-            self.rebuild();
-            return;
-        }
-        let previous_states = self.known_states();
-        {
-            let services = self.services.borrow();
-            let mut rows = self.rows.borrow_mut();
-            for (service, row) in services.iter().zip(rows.iter_mut()) {
-                if row.service.state != service.state {
-                    row.state_label.set_text(&service.state);
-                    for class in ["error", "warning", "dim-label"] {
-                        row.state_label.remove_css_class(class);
-                    }
-                    row.state_label.add_css_class(match service.state.as_str() {
-                        "Failed" => "error",
-                        "Unknown" => "warning",
-                        _ => "dim-label",
-                    });
-                }
-                if row.service.summary != service.summary {
-                    row.widget.set_tooltip_text(Some(&service.summary));
-                }
-                row.service = service.clone();
-            }
-        }
-        if self.known_states() != previous_states {
-            self.refresh_status_filter();
-        }
-        self.filter();
-        // Cheap text update only — never re-triggers a fresh Status query; that stays an
-        // explicit action (the Status button, or reselecting the row).
-        if let Some(service) = self.selected() {
-            self.title
-                .set_text(&format!("{} · {}", service.name, service.state));
-        }
-    }
     fn refresh(&self) {
-        self.refresh_impl(false);
-    }
-    /// For the periodic auto-refresh tick: no "Working…"/insensitive chrome, and an in-place
-    /// row update instead of a full rebuild when nothing about the service set changed.
-    fn refresh_quiet(&self) {
-        self.refresh_impl(true);
-    }
-    fn refresh_impl(&self, quiet: bool) {
-        self.countdown.set(AUTO_REFRESH_SECONDS);
         let scope = self.scope();
         let backend = self.backend();
         let work = move || {
             if backend == Backend::Dinit {
-                // Quiet (auto-refresh) must never trigger its own pkexec prompt — only use an
-                // already-authenticated helper session, same reasoning as `job_quiet` not
-                // touching `body`: this tick should be invisible unless something is wrong.
-                let listing = if quiet {
-                    pilot::request_passive(scope, "list", None)
-                } else {
-                    pilot::request(scope, "list", None)
-                };
+                let listing = pilot::request(scope, "list", None);
                 let services = pilot::discover(
                     scope,
                     listing.as_ref().map(String::as_str).map_err(String::as_str),
@@ -395,22 +294,15 @@ impl Ui {
             }
         };
         let done = move |ui: &Ui, (services, warning): (Vec<Service>, Option<String>)| {
-            let changed = *ui.services.borrow() != services;
             *ui.services.borrow_mut() = services;
-            if quiet {
-                if changed {
-                    ui.sync_rows();
-                }
-            } else {
-                ui.rebuild();
-            }
+            ui.rebuild();
             if let Some(warning) = warning {
                 ui.message.set_text(&format!(
                     "Showing available definitions; {}",
                     pilot::friendly_unavailable_reason(&warning)
                 ));
                 ui.message.add_css_class("error");
-            } else if !quiet || changed {
+            } else {
                 ui.message.set_text(&format!(
                     "{} services · {} manager ({})",
                     ui.services.borrow().len(),
@@ -424,20 +316,16 @@ impl Ui {
                 ui.message.remove_css_class("error");
             }
         };
-        if quiet {
-            self.job_quiet(work, done);
-        } else {
-            self.job(work, done);
-        }
+        self.job(work, done);
     }
-    fn inspect(&self, action: &'static str) {
+    fn show_log(&self) {
         let Some(service) = self.selected() else {
             return;
         };
         let scope = self.scope();
         let backend = self.backend();
         self.job(
-            move || backend.request(scope, action, Some(&service.name)),
+            move || backend.request(scope, "catlog", Some(&service.name)),
             |ui, text| {
                 ui.detail.set_text(if text.is_empty() {
                     "No buffered output. Logs require log-type = buffer in the service definition."
@@ -446,6 +334,73 @@ impl Ui {
                 });
             },
         );
+    }
+    /// Refreshes only the selected service: its detailed status text for the console panel, and
+    /// (separately, via `Backend::service` — see its doc comment for why this isn't derived from
+    /// the same status text) its row's state/tooltip and the title badge. Replaces relying on a
+    /// periodic full-list auto-refresh to keep the row everyone's actually looking at current.
+    fn refresh_selected(&self) {
+        let Some(service) = self.selected() else {
+            return;
+        };
+        let scope = self.scope();
+        let backend = self.backend();
+        let name = service.name.clone();
+        self.job_quiet(
+            move || {
+                let text = backend.request(scope, "status", Some(&name))?;
+                let service = backend.service(scope, &name)?;
+                Ok((text, service))
+            },
+            |ui, (text, service): (String, Service)| {
+                ui.detail.set_text(&text);
+                ui.apply_service(service);
+            },
+        );
+    }
+    /// Patches one row's state/tooltip and the title badge from a freshly fetched `Service`,
+    /// without touching any other row — the "refresh only that service" counterpart to
+    /// `rebuild()`'s whole-list rebuild. A no-op if the service is no longer in the list (e.g.
+    /// deleted, or the scope changed under the in-flight request).
+    fn apply_service(&self, service: Service) {
+        let previous_states = self.known_states();
+        if let Some(existing) = self
+            .services
+            .borrow_mut()
+            .iter_mut()
+            .find(|s| s.name == service.name)
+        {
+            *existing = service.clone();
+        }
+        {
+            let mut rows = self.rows.borrow_mut();
+            let Some(row) = rows.iter_mut().find(|r| r.service.name == service.name) else {
+                return;
+            };
+            if row.service.state != service.state {
+                row.state_label.set_text(&service.state);
+                for class in ["error", "warning", "dim-label"] {
+                    row.state_label.remove_css_class(class);
+                }
+                row.state_label.add_css_class(match service.state.as_str() {
+                    "Failed" => "error",
+                    "Unknown" => "warning",
+                    _ => "dim-label",
+                });
+            }
+            if row.service.summary != service.summary {
+                row.widget.set_tooltip_text(Some(&service.summary));
+            }
+            row.service = service.clone();
+        }
+        if self.known_states() != previous_states {
+            self.refresh_status_filter();
+        }
+        self.filter();
+        if self.selected().is_some_and(|s| s.name == service.name) {
+            self.title
+                .set_text(&format!("{} · {}", service.name, service.state));
+        }
     }
     fn execute(&self, action: &'static str, name: String) {
         let scope = self.scope();
@@ -1148,18 +1103,6 @@ fn build(app: &gtk::Application, system_backend: Backend, user_backend: Backend)
     status_filter.set_tooltip_text(Some("Filter by status"));
     let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
     refresh.set_tooltip_text(Some("Refresh services"));
-    let auto_refresh_spinner = gtk::Spinner::new();
-    auto_refresh_spinner.set_spinning(true);
-    let auto_refresh = gtk::ToggleButton::new();
-    auto_refresh.set_child(Some(&auto_refresh_spinner));
-    auto_refresh.set_active(true);
-    auto_refresh.set_tooltip_text(Some(&format!(
-        "Auto-refresh ({AUTO_REFRESH_SECONDS}s) — click to pause"
-    )));
-    {
-        let spinner = auto_refresh_spinner.clone();
-        auto_refresh.connect_toggled(move |button| spinner.set_spinning(button.is_active()));
-    }
     let environment_btn = gtk::Button::with_label("Environment…");
     environment_btn.set_tooltip_text(Some("Set or unset dinit's activation environment"));
     let add = gtk::Button::with_label("Add…");
@@ -1168,7 +1111,6 @@ fn build(app: &gtk::Application, system_backend: Backend, user_backend: Backend)
     toolbar.append(&search);
     toolbar.append(&status_filter);
     toolbar.append(&refresh);
-    toolbar.append(&auto_refresh);
     toolbar.append(&environment_btn);
     toolbar.append(&add);
     body.append(&toolbar);
@@ -1294,8 +1236,6 @@ fn build(app: &gtk::Application, system_backend: Backend, user_backend: Backend)
         scope,
         search,
         status_filter,
-        auto_refresh: auto_refresh.clone(),
-        countdown: Rc::new(Cell::new(AUTO_REFRESH_SECONDS)),
         list,
         title,
         subtitle,
@@ -1315,7 +1255,6 @@ fn build(app: &gtk::Application, system_backend: Backend, user_backend: Backend)
         rows: Default::default(),
     };
     ui.apply_backend_dependent_ui();
-    ui.start_auto_refresh();
     let clone = ui.clone();
     refresh.connect_clicked(move |_| clone.refresh());
     let clone = ui.clone();
@@ -1369,16 +1308,16 @@ fn build(app: &gtk::Application, system_backend: Backend, user_backend: Backend)
                     !matches!(service.state.as_str(), "Started" | "Starting" | "Stopping")
                 };
             clone.delete.set_sensitive(deletable);
-            clone.inspect("status");
+            clone.refresh_selected();
         } else {
             clone.subtitle.set_text("");
             clone.delete.set_sensitive(false);
         }
     });
     let clone = ui.clone();
-    status.connect_clicked(move |_| clone.inspect("status"));
+    status.connect_clicked(move |_| clone.refresh_selected());
     let clone = ui.clone();
-    ui.logs.connect_clicked(move |_| clone.inspect("catlog"));
+    ui.logs.connect_clicked(move |_| clone.show_log());
     let clone = ui.clone();
     ui.unpin.connect_clicked(move |_| clone.action("unpin"));
     let clone = ui.clone();

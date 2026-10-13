@@ -207,29 +207,41 @@ pub fn list(scope: Scope) -> Result<Vec<Service>, String> {
     }
     Ok(names
         .into_iter()
-        .map(|name| {
-            let target = active.join(&name);
-            if !exists(&target) {
-                return Service {
-                    name,
-                    state: "Disabled".into(),
-                    summary: "Available, not enabled".into(),
-                };
-            }
-            match crate::Backend::Runit.request(scope, "status", Some(&name)) {
-                Ok(text) => Service {
-                    name,
-                    state: state_for_status(&text).into(),
-                    summary: text.trim().into(),
-                },
-                Err(error) => Service {
-                    name,
-                    state: "Unknown".into(),
-                    summary: format!("Status unavailable: {error}"),
-                },
-            }
-        })
+        .map(|name| service_status(scope, &active, name))
         .collect())
+}
+
+/// One entry of `list()`'s mapping, factored out so a single-service refresh (selecting a row)
+/// can look up just that one service without re-querying every other one.
+fn service_status(scope: Scope, active: &Path, name: String) -> Service {
+    let target = active.join(&name);
+    if !exists(&target) {
+        return Service {
+            name,
+            state: "Disabled".into(),
+            summary: "Available, not enabled".into(),
+        };
+    }
+    match crate::Backend::Runit.request(scope, "status", Some(&name)) {
+        Ok(text) => Service {
+            name,
+            state: state_for_status(&text).into(),
+            summary: text.trim().into(),
+        },
+        Err(error) => Service {
+            name,
+            state: "Unknown".into(),
+            summary: format!("Status unavailable: {error}"),
+        },
+    }
+}
+
+/// Refreshes a single service's live state directly (one `sv status`), instead of `list()`'s
+/// full directory scan — for when the GUI only needs to update the one row the user selected.
+pub fn service(scope: Scope, name: &str) -> Result<Service, String> {
+    validate_name("status", Some(name))?;
+    let (_, active) = dirs(scope)?;
+    Ok(service_status(scope, &active, name.to_owned()))
 }
 
 pub fn request(scope: Scope, action: &str, service: Option<&str>) -> Result<String, String> {
@@ -309,6 +321,12 @@ fn request_at(available: &Path, active: &Path, action: &str, name: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Guards the two tests below that mutate the process-wide `HOME` env var — same reasoning
+    /// as lib.rs's `XDG_CONFIG_HOME_LOCK`.
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn state_for_status_covers_base_and_paused() {
         assert_eq!(state_for_status("run: dbus: (pid 123) 10s"), "Started");
@@ -379,12 +397,10 @@ mod tests {
     }
     #[test]
     fn set_down_creates_and_removes_the_down_file() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let base = std::env::temp_dir().join(format!("pilot-runit-down-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
-        // Single test function, start to finish on one thread: no other test reads or writes
-        // HOME, so there's no data race on this process-wide env var despite cargo test's
-        // default threading (same reasoning as lib.rs's XDG_CONFIG_HOME roundtrip test).
         unsafe { std::env::set_var("HOME", &base) };
 
         let contents = render_run_file("/bin/sleep infinity").unwrap();
@@ -400,6 +416,33 @@ mod tests {
         set_down("worker", false).unwrap();
         assert!(!down_path.exists());
         set_down("worker", false).unwrap(); // idempotent when already absent
+
+        unsafe { std::env::remove_var("HOME") };
+        fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn service_looks_up_one_entry_without_listing_the_rest() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let base = std::env::temp_dir().join(format!("pilot-runit-service-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        unsafe { std::env::set_var("HOME", &base) };
+
+        let contents = render_run_file("/bin/sleep infinity").unwrap();
+        create_user_service("worker", &contents, &[]).unwrap();
+        let disabled = service(Scope::User, "worker").unwrap();
+        assert_eq!(disabled.state, "Disabled");
+
+        let (available, active) = dirs(Scope::User).unwrap();
+        fs::create_dir_all(&active).unwrap();
+        request_at(&available, &active, "enable", "worker").unwrap();
+        // No real runsv is supervising this directory, so `sv status` itself fails — still a
+        // real, deterministic answer from `service()`, not a listing of every other service.
+        let enabled = service(Scope::User, "worker").unwrap();
+        assert_eq!(enabled.state, "Unknown");
+        assert!(enabled.summary.starts_with("Status unavailable:"));
+
+        assert!(service(Scope::User, "../etc/passwd").is_err());
 
         unsafe { std::env::remove_var("HOME") };
         fs::remove_dir_all(base).unwrap();
