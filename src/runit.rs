@@ -40,6 +40,28 @@ fn exists(path: &std::path::Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
+/// `sv status`'s text is already human-readable prose (unlike dinit's packed indicator), so the
+/// only real gap is the base state: `runsv` writes `run`, `down`, or `finish` (the finish script
+/// is running after the main process exited — not yet fully stopped) to `supervise/stat`, but
+/// this used to bucket anything but `run:`/`down:` into "Unknown". `paused` (SIGSTOP'd) is
+/// promoted over the base state since a paused process still holds a PID and looks alive
+/// otherwise; `want up`/`want down`/`got TERM`/`normally up`/`normally down` stay in the full
+/// text (already shown as the row's summary/tooltip) rather than growing the state vocabulary
+/// further.
+fn state_for_status(text: &str) -> &'static str {
+    if text.contains(", paused") {
+        "Paused"
+    } else if text.starts_with("run:") {
+        "Started"
+    } else if text.starts_with("down:") {
+        "Stopped"
+    } else if text.starts_with("finish:") {
+        "Finishing"
+    } else {
+        "Unknown"
+    }
+}
+
 pub fn enabled(scope: Scope, name: &str) -> Option<String> {
     let (_, active) = paths(scope, name).ok()?;
     Some(format!(
@@ -52,6 +74,34 @@ pub fn user_definition_path(name: &str) -> Option<PathBuf> {
     let (available, _) = dirs(Scope::User).ok()?;
     validate_name("status", Some(name)).ok()?;
     Some(available.join(name))
+}
+
+/// Where `name`'s service directory actually lives, for either scope. `None` unless it exists
+/// on disk — shown to the user, so an unconfirmed guess isn't useful here.
+pub fn definition_path(scope: Scope, name: &str) -> Option<PathBuf> {
+    validate_name("status", Some(name)).ok()?;
+    let (available, _) = dirs(scope).ok()?;
+    let dir = available.join(name);
+    exists(&dir).then_some(dir)
+}
+
+/// Creates or removes the `down` file in `name`'s user-scope service directory: while present,
+/// `runsv` does not start `./run` on its own (`runsv(8)`) — the service still exists and can
+/// still be started manually (`sv up` / Pilot's Start), it just won't come up automatically,
+/// including after the process next exits, not only on first discovery.
+pub fn set_down(name: &str, down: bool) -> Result<(), String> {
+    validate_name("status", Some(name))?;
+    let (available, _) = dirs(Scope::User)?;
+    let path = available.join(name).join("down");
+    if down {
+        fs::File::create(&path)
+            .map(|_| ())
+            .map_err(|e| format!("{}: {e}", path.display()))
+    } else if exists(&path) {
+        fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))
+    } else {
+        Ok(())
+    }
 }
 
 /// The entered command is a shell command in a runit `run` script.
@@ -167,20 +217,11 @@ pub fn list(scope: Scope) -> Result<Vec<Service>, String> {
                 };
             }
             match crate::Backend::Runit.request(scope, "status", Some(&name)) {
-                Ok(text) => {
-                    let state = if text.starts_with("run:") {
-                        "Started"
-                    } else if text.starts_with("down:") {
-                        "Stopped"
-                    } else {
-                        "Unknown"
-                    };
-                    Service {
-                        name,
-                        state: state.into(),
-                        summary: text.trim().into(),
-                    }
-                }
+                Ok(text) => Service {
+                    name,
+                    state: state_for_status(&text).into(),
+                    summary: text.trim().into(),
+                },
                 Err(error) => Service {
                     name,
                     state: "Unknown".into(),
@@ -269,6 +310,20 @@ fn request_at(available: &Path, active: &Path, action: &str, name: &str) -> Resu
 mod tests {
     use super::*;
     #[test]
+    fn state_for_status_covers_base_and_paused() {
+        assert_eq!(state_for_status("run: dbus: (pid 123) 10s"), "Started");
+        assert_eq!(
+            state_for_status("down: dbus: 5s, normally up, want up"),
+            "Stopped"
+        );
+        assert_eq!(state_for_status("finish: dbus: (pid 123) 0s"), "Finishing");
+        assert_eq!(
+            state_for_status("run: dbus: (pid 123) 10s, paused"),
+            "Paused"
+        );
+        assert_eq!(state_for_status("unexpected text"), "Unknown");
+    }
+    #[test]
     fn only_expected_actions_and_names() {
         assert!(validate("start", Some("dbus")).is_ok());
         assert!(validate("catlog", Some("dbus")).is_err());
@@ -320,6 +375,33 @@ mod tests {
         request_at(&available, &active, "disable", "worker").unwrap();
         delete_user_service_at(&available, &active, "worker").unwrap();
         assert!(!path.exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn set_down_creates_and_removes_the_down_file() {
+        let base = std::env::temp_dir().join(format!("pilot-runit-down-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        // Single test function, start to finish on one thread: no other test reads or writes
+        // HOME, so there's no data race on this process-wide env var despite cargo test's
+        // default threading (same reasoning as lib.rs's XDG_CONFIG_HOME roundtrip test).
+        unsafe { std::env::set_var("HOME", &base) };
+
+        let contents = render_run_file("/bin/sleep infinity").unwrap();
+        create_user_service("worker", &contents, &[]).unwrap();
+        let down_path = base.join(".local/share/sv/worker/down");
+        assert!(!down_path.exists());
+
+        set_down("worker", true).unwrap();
+        assert!(down_path.exists());
+        set_down("worker", true).unwrap(); // idempotent
+        assert!(down_path.exists());
+
+        set_down("worker", false).unwrap();
+        assert!(!down_path.exists());
+        set_down("worker", false).unwrap(); // idempotent when already absent
+
+        unsafe { std::env::remove_var("HOME") };
         fs::remove_dir_all(base).unwrap();
     }
 }

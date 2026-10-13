@@ -2,7 +2,8 @@
 //! for the session, speaking a line-oriented protocol over stdin/stdout.
 //! Zero external crates, no GTK, so it stays small and auditable.
 //!
-//! Request:  "<ACTION> [SERVICE]"
+//! Request:  "<BACKEND> <ACTION> [ARG]..." (whitespace-tokenized; every arg is pre-validated by
+//! the caller to contain no whitespace of its own, so this split is lossless)
 //! Response: "OK <len>\n<len bytes>" or "ERROR <len>\n<len bytes>"
 //! "QUIT" replies "OK 0\n" and exits.
 
@@ -29,19 +30,21 @@ fn respond(status: &str, body: &str) {
 }
 
 fn handle_line(line: &str) {
-    let (backend, rest) = match line.split_once(' ') {
-        Some(("dinit", rest)) => (pilot::Backend::Dinit, rest),
-        Some(("runit", rest)) => (pilot::Backend::Runit, rest),
+    let mut parts = line.split_whitespace();
+    let backend = match parts.next() {
+        Some("dinit") => pilot::Backend::Dinit,
+        Some("runit") => pilot::Backend::Runit,
         _ => {
             respond("ERROR", "Unknown backend");
             return;
         }
     };
-    let (action, service) = match rest.split_once(' ') {
-        Some((action, service)) => (action, Some(service)),
-        None => (rest, None),
+    let Some(action) = parts.next() else {
+        respond("ERROR", "Missing action");
+        return;
     };
-    match backend.execute_system(action, service) {
+    let args: Vec<&str> = parts.collect();
+    match backend.execute_system(action, &args) {
         Ok(text) => respond("OK", &text),
         Err(error) => respond("ERROR", &error),
     }
