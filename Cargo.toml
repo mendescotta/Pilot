@@ -1,0 +1,27 @@
+[package]
+name = "pilot"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "GTK4 service manager for dinit"
+default-run = "pilot"
+
+[features]
+default = ["gui"]
+gui = ["dep:gtk"]
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9", optional = true }
+
+[[bin]]
+name = "pilot"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "pilot-helper"
+path = "src/bin/helper.rs"
+
+[profile.release]
+lto = "thin"
+strip = true

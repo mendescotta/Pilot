@@ -1,0 +1,16 @@
+@AGENTS.md
+
+# pilot
+
+GTK4 desktop manager for dinit and runit (formerly Dinkit), with separate unprivileged UI and small
+`pkexec` helper. Read `README.md` and local `DEVNOTES.md` (if present) for behavior and protocol.
+
+- The GUI never runs as root. Keep the helper allowlisted and GTK-free.
+- Preserve user versus system service scope and the exact add/delete preview.
+- Treat dinit/runit output and service names as untrusted input. Runit system
+  paths are fixed to `/etc/sv` and `/var/service`; user paths follow README.md.
+- Run `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`,
+  and `cargo test --locked`. For headless logic, use
+  `cargo test --no-default-features`.
+- The ignored dinit integration test uses a private temporary daemon. Run it
+  when changing service command behavior; it must never use host services.

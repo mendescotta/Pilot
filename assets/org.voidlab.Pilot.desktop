@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Pilot
+Comment=Manage dinit services
+Exec=pilot
+Icon=org.voidlab.Pilot
+Terminal=false
+Type=Application
+Categories=System;Settings;
+Keywords=dinit;services;init;
