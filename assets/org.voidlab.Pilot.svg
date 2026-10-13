@@ -1,7 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-  <rect x="8" y="8" width="112" height="112" rx="26" fill="#3584e4"/>
-  <g fill="none" stroke="#fff" stroke-width="8" stroke-linecap="round">
-    <path d="M42 38h48M42 64h48M42 90h48"/>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5fb488"/>
+      <stop offset="1" stop-color="#2f6b4c"/>
+    </linearGradient>
+    <linearGradient id="stripeLit" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eafff2"/>
+    </linearGradient>
+    <linearGradient id="stripeShade" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#eafff2"/>
+      <stop offset="1" stop-color="#b3ded1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Match the Voyage and Vessel launcher tiles. -->
+  <rect x="6" y="6" width="116" height="116" rx="30" fill="url(#bg)"/>
+  <ellipse cx="64" cy="30" rx="46" ry="20" fill="#ffffff" opacity="0.08"/>
+
+  <!-- Three faceted military chevrons. -->
+  <g fill="url(#stripeLit)">
+    <path d="M31 47 64 23 64 34 31 58Z"/>
+    <path d="M31 70 64 46 64 57 31 81Z"/>
+    <path d="M31 93 64 69 64 80 31 104Z"/>
   </g>
-  <g fill="#fff"><circle cx="28" cy="38" r="5"/><circle cx="28" cy="64" r="5"/><circle cx="28" cy="90" r="5"/></g>
+  <g fill="url(#stripeShade)">
+    <path d="M64 23 97 47 97 58 64 34Z"/>
+    <path d="M64 46 97 70 97 81 64 57Z"/>
+    <path d="M64 69 97 93 97 104 64 80Z"/>
+  </g>
 </svg>

@@ -1122,6 +1122,7 @@ fn build(app: &gtk::Application, system_backend: Backend, user_backend: Backend)
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Pilot")
+        .icon_name("org.voidlab.Pilot")
         .default_width(1000)
         .default_height(680)
         .build();
