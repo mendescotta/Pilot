@@ -15,7 +15,7 @@ A Rust and GTK4 desktop manager for **dinit and runit**, formerly Dinkit. Inspir
 Prebuilt package (Void Linux, x86_64):
 
 ```sh
-curl -fLO https://github.com/mendescotta/pilot/releases/download/v0.1.0/pilot-x86_64.xbps
+curl -fLO https://github.com/mendescotta/pilot/releases/download/v0.1.1/pilot-x86_64.xbps
 xbps-rindex -a pilot-x86_64.xbps
 sudo xbps-install --repository=. -S pilot
 ```
