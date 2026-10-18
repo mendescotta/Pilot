@@ -193,22 +193,41 @@ pub fn list(scope: Scope) -> Result<Vec<Service>, String> {
             active.display()
         ));
     }
+    Ok(service_names(&available, &active)?
+        .into_iter()
+        .map(|name| service_status(scope, &active, name))
+        .collect())
+}
+
+fn service_names(available: &Path, active: &Path) -> Result<BTreeSet<String>, String> {
     let mut names = BTreeSet::new();
-    for dir in [&available, &active] {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if validate_name("status", Some(name)).is_ok() && entry.path().is_dir() {
-                        names.insert(name.to_string());
+    for dir in [available, active] {
+        match fs::metadata(dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", dir.display())),
+        }
+        let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+            if let Some(name) = entry.file_name().to_str() {
+                if validate_name("status", Some(name)).is_ok() {
+                    match entry.metadata() {
+                        Ok(metadata) if metadata.is_dir() => {
+                            names.insert(name.to_string());
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(format!("{}: {error}", entry.path().display()));
+                        }
                     }
                 }
             }
         }
     }
-    Ok(names
-        .into_iter()
-        .map(|name| service_status(scope, &active, name))
-        .collect())
+    Ok(names)
 }
 
 /// One entry of `list()`'s mapping, factored out so a single-service refresh (selecting a row)
@@ -351,6 +370,23 @@ mod tests {
             "#!/bin/sh\nexec /usr/bin/demo --flag\n"
         );
         assert!(render_run_file("echo ok\nrm -rf /tmp").is_err());
+    }
+
+    #[test]
+    fn service_names_merges_live_links_and_available_definitions() {
+        let base = std::env::temp_dir().join(format!("pilot-runit-list-{}", std::process::id()));
+        let available = base.join("sv");
+        let active = base.join("service");
+        fs::create_dir_all(available.join("dbus")).unwrap();
+        fs::create_dir_all(active.join("orphan")).unwrap();
+        symlink(available.join("dbus"), active.join("dbus")).unwrap();
+        fs::write(active.join("not-a-service"), "ignored").unwrap();
+
+        assert_eq!(
+            service_names(&available, &active).unwrap(),
+            BTreeSet::from(["dbus".to_string(), "orphan".to_string()])
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

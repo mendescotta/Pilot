@@ -20,6 +20,16 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Prefer the system manager on runit systems without a per-user dinit instance (turnstile).
+    /// A detected user dinit instance means the user's service scope is the useful default.
+    pub fn default_scope(system: Self, user: Self) -> Scope {
+        if system == Self::Runit && user == Self::Runit {
+            Scope::System
+        } else {
+            Scope::User
+        }
+    }
+
     /// Detects the system-scope backend (PID 1) and, independently, the backend serving the
     /// user's own instance. These can differ: e.g. a runit PID 1 with a per-user dinit instance
     /// started by turnstile. `--dinit`/`--runit` force both scopes to the same value.
@@ -115,16 +125,10 @@ impl Backend {
                 if scope == Scope::System && action != "status" {
                     privileged_request(self, action, &args)
                 } else {
-                    runit::request(scope, action, service).or_else(|error| {
-                        if scope == Scope::System
-                            && action == "status"
-                            && error.to_ascii_lowercase().contains("permission denied")
-                        {
-                            privileged_request(self, action, &args)
-                        } else {
-                            Err(error)
-                        }
-                    })
+                    // Listing and status are read-only and must never trigger authentication.
+                    // If the live supervisor denies access, show that status as unavailable;
+                    // the user can still inspect every discovered service.
+                    runit::request(scope, action, service)
                 }
             }
         }
@@ -1160,6 +1164,22 @@ mod tests {
     #[test]
     fn resolve_user_backend_is_dinit_when_system_already_is() {
         assert_eq!(resolve_user_backend(Backend::Dinit, false), Backend::Dinit);
+    }
+
+    #[test]
+    fn default_scope_uses_system_runit_only_without_user_dinit() {
+        assert_eq!(
+            Backend::default_scope(Backend::Runit, Backend::Runit),
+            Scope::System
+        );
+        assert_eq!(
+            Backend::default_scope(Backend::Runit, Backend::Dinit),
+            Scope::User
+        );
+        assert_eq!(
+            Backend::default_scope(Backend::Dinit, Backend::Dinit),
+            Scope::User
+        );
     }
     #[test]
     fn backend_for_comm_accepts_distro_naming_variants() {

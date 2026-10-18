@@ -1,3 +1,5 @@
+mod renderer;
+
 use gtk::{glib, prelude::*};
 use pilot::{Backend, Scope, Service};
 use std::{
@@ -1093,9 +1095,9 @@ fn build(app: &gtk::Application, system_backend: Backend, user_backend: Backend)
     let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
     let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     let scope = gtk::DropDown::from_strings(&["User services", "System services"]);
-    if system_backend == Backend::Runit {
-        scope.set_selected(1);
-    }
+    scope.set_selected(u32::from(
+        Backend::default_scope(system_backend, user_backend) == Scope::System,
+    ));
     let search = gtk::SearchEntry::new();
     search.set_hexpand(true);
     search.set_placeholder_text(Some("Search services or states"));
@@ -1342,6 +1344,7 @@ fn build(app: &gtk::Application, system_backend: Backend, user_backend: Backend)
 }
 
 fn main() -> glib::ExitCode {
+    renderer::configure_at_startup();
     let (system_backend, user_backend) = match Backend::detect() {
         Ok(backends) => backends,
         Err(error) => {
