@@ -57,8 +57,6 @@ if [ "$MODE" = uninstall ]; then
             "$DATADIR/polkit-1/actions/org.voidlab.Pilot.policy" \
             "$DESKTOP_FILE" \
             "$APP_ICON"
-        echo "Not removing $PREFIX/lib/dinit.d/user/boot.d: other packages may rely on it" \
-            "(turnstile's dinit backend expects it to exist)."
     else
         rm -fv "$DESKTOP_FILE" "$APP_ICON"
     fi
@@ -80,9 +78,6 @@ if [ "$SCOPE" = system ]; then
         "$DATADIR/polkit-1/actions/org.voidlab.Pilot.policy"
     install -Dm644 "$SRC_DIR/assets/org.voidlab.Pilot.desktop" "$DESKTOP_FILE"
     install -Dm644 "$SRC_DIR/assets/org.voidlab.Pilot.svg" "$APP_ICON"
-    # Turnstile's dinit backend expects this to exist but never creates it itself (it only
-    # mkdir -p's the per-user boot dir inside $HOME, not this system-wide one).
-    install -dm755 "$PREFIX/lib/dinit.d/user/boot.d"
 
     refresh_desktop_caches
     echo "Installed. Launch with: pilot"
@@ -104,6 +99,6 @@ else
     echo "Registered $BIN for this user."
     echo "(Re)launch Pilot — the desktop shell will now show its real icon and name."
     echo "Note: --user mode only wires desktop integration; it can't install the polkit" \
-        "policy or privileged helper (both need root), so System-scope actions won't" \
+        "policy or privileged helper (both need root), so system actions won't" \
         "authenticate. Use the default system-wide mode for that."
 fi

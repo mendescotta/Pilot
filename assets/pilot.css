@@ -1,0 +1,14 @@
+/* Follow the desktop palette in light, dark and high-contrast themes. */
+.app-title, .service-name { font-weight: 600; }
+.page-title { font-size: 24px; font-weight: 700; }
+.section-title { font-size: 18px; font-weight: 600; }
+.health { font-weight: 600; }
+.badge { font-size: 0.85em; border-radius: 12px; padding: 4px 9px; background: alpha(@theme_fg_color, 0.07); }
+.service-list { background: transparent; }
+.service-list row { border-radius: 8px; margin: 2px 8px; }
+.service-list row:selected { background: alpha(@theme_selected_bg_color, 0.22); color: @theme_fg_color; }
+.service-list row.failure image { color: @error_color; }
+.service-list row.running image { color: @theme_selected_bg_color; }
+.service-sidebar { background: alpha(@theme_fg_color, 0.025); }
+textview { background: transparent; }
+button { padding: 7px 12px; }

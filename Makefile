@@ -16,4 +16,3 @@ install:
 	install -Dm644 assets/org.voidlab.Pilot.desktop $(DESTDIR)$(PREFIX)/share/applications/org.voidlab.Pilot.desktop
 	install -Dm644 assets/org.voidlab.Pilot.svg $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/org.voidlab.Pilot.svg
 	install -Dm644 assets/org.voidlab.Pilot.policy $(DESTDIR)/usr/share/polkit-1/actions/org.voidlab.Pilot.policy
-	install -dm755 $(DESTDIR)/usr/lib/dinit.d/user/boot.d

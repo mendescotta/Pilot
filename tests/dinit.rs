@@ -54,11 +54,29 @@ fn private_daemon_lifecycle() {
         assert!(Instant::now() < deadline, "daemon did not become ready");
         thread::sleep(Duration::from_millis(20));
     }
+    let isolate = |command: Command| {
+        let mut isolated = Command::new(command.get_program());
+        // Replace every discovered system socket argument before invoking any command.
+        let mut args = command.get_args();
+        let mut retained = Vec::new();
+        while let Some(arg) = args.next() {
+            if matches!(arg.to_str(), Some("-p" | "--socket-path")) {
+                args.next();
+            } else {
+                retained.push(arg.to_owned());
+            }
+        }
+        isolated
+            .arg("--socket-path")
+            .arg(&socket)
+            .args(retained)
+            .env_remove("DINIT_SOCKET_PATH")
+            .env_remove("DINIT_CS_FD")
+            .env("LC_ALL", "C");
+        isolated
+    };
     let run = |action, name| {
-        let mut cmd = pilot::command(pilot::Scope::User, action, name).unwrap();
-        // Explicit socket allowed only here, on the isolated test instance.
-        cmd.env("DINIT_SOCKET_PATH", &socket);
-        pilot::output(cmd).unwrap()
+        pilot::output(isolate(pilot::dinit::command(action, name).unwrap())).unwrap()
     };
     assert!(pilot::parse_list(&run("list", None))
         .iter()
@@ -97,4 +115,48 @@ fn private_daemon_lifecycle() {
     assert!(!socket.parent().unwrap().join("boot.d/worker").exists());
     run("stop", Some("worker"));
     wait_for("Stopped");
+    let typed = |action: pilot::Action, name: &str| {
+        pilot::output(isolate(pilot::dinit::action_command(action, name).unwrap())).unwrap()
+    };
+    let mut monitor =
+        pilot::events::EventMonitor::start_with_socket(vec!["worker".into()], Some(&socket))
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while monitor.revision().unwrap_or(0) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "Monitor did not report initial state"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let previous = monitor.revision().unwrap();
+    typed(pilot::Action::StartPinned, "worker");
+    wait_for("Started");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while monitor.revision().unwrap_or(0) <= previous {
+        assert!(Instant::now() < deadline, "Monitor missed lifecycle change");
+        thread::sleep(Duration::from_millis(20));
+    }
+    typed(pilot::Action::Unpin, "worker");
+    typed(pilot::Action::ClearLog, "worker");
+    typed(pilot::Action::Check, "worker");
+    typed(pilot::Action::StopPinned, "worker");
+    wait_for("Stopped");
+    typed(pilot::Action::Unpin, "worker");
+    std::fs::write(socket.parent().unwrap().join("gate"), "type = triggered\n").unwrap();
+    typed(pilot::Action::Start, "gate");
+    typed(pilot::Action::Trigger, "gate");
+    typed(pilot::Action::Untrigger, "gate");
+    typed(pilot::Action::Stop, "gate");
+    for enabled in [true, false] {
+        let command = pilot::dinit::relation_command(
+            "worker",
+            &pilot::DinitRelation::Persistent {
+                from: "boot".into(),
+                enabled,
+            },
+        )
+        .unwrap();
+        pilot::output(isolate(command)).unwrap();
+    }
 }

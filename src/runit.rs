@@ -1,269 +1,59 @@
-use crate::{output, validate as validate_name, Scope, Service};
+//! Void system runit. Fixed roots; a secondary runsvdir never selects this backend.
+use crate::{output, validate_name, Access, Action, Inspection, Service, Snapshot};
 use std::{
     collections::BTreeSet,
     fs,
-    io::Write,
     os::unix::fs::symlink,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
 };
 
-fn dirs(scope: Scope) -> Result<(PathBuf, PathBuf), String> {
-    match scope {
-        Scope::System => Ok((PathBuf::from("/etc/sv"), PathBuf::from("/var/service"))),
-        Scope::User => {
-            let home = std::env::var_os("HOME").ok_or("HOME is unset")?;
-            let home = PathBuf::from(home);
-            Ok((home.join(".local/share/sv"), home.join(".local/service")))
-        }
-    }
-}
-
-pub fn validate(action: &str, service: Option<&str>) -> Result<(), String> {
-    if !matches!(
-        action,
-        "status" | "start" | "stop" | "restart" | "enable" | "disable" | "reload"
-    ) {
-        return Err(format!("{action} is not supported for runit"));
-    }
-    validate_name("status", service)
-}
-
-fn paths(scope: Scope, name: &str) -> Result<(PathBuf, PathBuf), String> {
-    validate_name("status", Some(name))?;
-    let (available, active) = dirs(scope)?;
-    Ok((available.join(name), active.join(name)))
-}
-
-fn exists(path: &std::path::Path) -> bool {
+pub const AVAILABLE: &str = "/etc/sv";
+pub const ACTIVE: &str = "/var/service";
+fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
-
-/// `sv status`'s text is already human-readable prose (unlike dinit's packed indicator), so the
-/// only real gap is the base state: `runsv` writes `run`, `down`, or `finish` (the finish script
-/// is running after the main process exited — not yet fully stopped) to `supervise/stat`, but
-/// this used to bucket anything but `run:`/`down:` into "Unknown". `paused` (SIGSTOP'd) is
-/// promoted over the base state since a paused process still holds a PID and looks alive
-/// otherwise; `want up`/`want down`/`got TERM`/`normally up`/`normally down` stay in the full
-/// text (already shown as the row's summary/tooltip) rather than growing the state vocabulary
-/// further.
-fn state_for_status(text: &str) -> &'static str {
-    if text.contains(", paused") {
-        "Paused"
-    } else if text.starts_with("run:") {
-        "Started"
-    } else if text.starts_with("down:") {
-        "Stopped"
-    } else if text.starts_with("finish:") {
-        "Finishing"
-    } else {
-        "Unknown"
-    }
-}
-
-pub fn enabled(scope: Scope, name: &str) -> Option<String> {
-    let (_, active) = paths(scope, name).ok()?;
-    Some(format!(
-        "Enabled: {}",
-        if exists(&active) { "yes" } else { "no" }
-    ))
-}
-
-pub fn user_definition_path(name: &str) -> Option<PathBuf> {
-    let (available, _) = dirs(Scope::User).ok()?;
-    validate_name("status", Some(name)).ok()?;
-    Some(available.join(name))
-}
-
-/// Where `name`'s service directory actually lives, for either scope. `None` unless it exists
-/// on disk — shown to the user, so an unconfirmed guess isn't useful here.
-pub fn definition_path(scope: Scope, name: &str) -> Option<PathBuf> {
-    validate_name("status", Some(name)).ok()?;
-    let (available, _) = dirs(scope).ok()?;
-    let dir = available.join(name);
-    exists(&dir).then_some(dir)
-}
-
-/// Creates or removes the `down` file in `name`'s user-scope service directory: while present,
-/// `runsv` does not start `./run` on its own (`runsv(8)`) — the service still exists and can
-/// still be started manually (`sv up` / Pilot's Start), it just won't come up automatically,
-/// including after the process next exits, not only on first discovery.
-pub fn set_down(name: &str, down: bool) -> Result<(), String> {
-    validate_name("status", Some(name))?;
-    let (available, _) = dirs(Scope::User)?;
-    let path = available.join(name).join("down");
-    if down {
-        fs::File::create(&path)
-            .map(|_| ())
-            .map_err(|e| format!("{}: {e}", path.display()))
-    } else if exists(&path) {
-        fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))
-    } else {
-        Ok(())
-    }
-}
-
-/// The entered command is a shell command in a runit `run` script.
-pub fn render_run_file(command: &str) -> Result<String, String> {
-    if command.trim().is_empty() || command.chars().any(char::is_control) {
-        return Err("Enter a single-line command".into());
-    }
-    Ok(format!("#!/bin/sh\nexec {command}\n"))
-}
-
-pub fn create_user_service(
-    name: &str,
-    contents: &str,
-    existing: &[Service],
-) -> Result<PathBuf, String> {
-    let (available, _) = dirs(Scope::User)?;
-    create_user_service_at(&available, name, contents, existing)
-}
-
-fn create_user_service_at(
-    available: &Path,
-    name: &str,
-    contents: &str,
-    existing: &[Service],
-) -> Result<PathBuf, String> {
-    validate_name("status", Some(name))?;
-    if existing.iter().any(|service| service.name == name) {
-        return Err(format!("A service named \"{name}\" already exists"));
-    }
-    fs::create_dir_all(available).map_err(|e| format!("{}: {e}", available.display()))?;
-    let dir = available.join(name);
-    fs::create_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let run = dir.join("run");
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&run)
-            .map_err(|e| format!("{}: {e}", run.display()))?;
-        file.write_all(contents.as_bytes())
-            .map_err(|e| format!("{}: {e}", run.display()))?;
-        fs::set_permissions(&run, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("{}: {e}", run.display()))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&run);
-        let _ = fs::remove_dir(&dir);
-    }
-    result.map(|()| dir)
-}
-
-pub fn delete_user_service(name: &str) -> Result<PathBuf, String> {
-    let (available, active) = dirs(Scope::User)?;
-    delete_user_service_at(&available, &active, name)
-}
-
-fn delete_user_service_at(available: &Path, active: &Path, name: &str) -> Result<PathBuf, String> {
-    validate_name("status", Some(name))?;
-    if exists(&active.join(name)) {
-        return Err("Disable this runit service before deleting it".into());
-    }
-    let dir = available.join(name);
-    if fs::symlink_metadata(&dir)
-        .map_err(|e| e.to_string())?
-        .file_type()
-        .is_symlink()
-    {
-        return Err("Refusing to delete a linked service directory".into());
-    }
-    let entries = fs::read_dir(&dir)
-        .map_err(|e| e.to_string())?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    if entries.len() != 1 || entries[0] != "run" {
-        return Err("Service has additional files; remove it manually after review".into());
-    }
-    fs::remove_file(dir.join("run")).map_err(|e| e.to_string())?;
-    fs::remove_dir(&dir).map_err(|e| e.to_string())?;
-    Ok(dir)
-}
-
-pub fn list(scope: Scope) -> Result<Vec<Service>, String> {
-    let (_, active) = dirs(scope)?;
-    Ok(list_names(scope)?
-        .into_iter()
-        .map(|name| service_status(scope, &active, name))
-        .collect())
-}
-
-/// Lists service names without querying supervisor state. This is also the first, low-cost
-/// request used by Pilot's authenticated system refresh; status is then fetched through the
-/// privileged helper so runit's root-owned supervise sockets are readable.
-pub fn list_names(scope: Scope) -> Result<Vec<String>, String> {
-    let (available, active) = dirs(scope)?;
-    if !available.is_dir() && !active.is_dir() {
-        return Err(format!(
-            "No runit service directories: {} or {}",
-            available.display(),
-            active.display()
-        ));
-    }
-    Ok(service_names(&available, &active)?.into_iter().collect())
-}
-
-fn service_names(available: &Path, active: &Path) -> Result<BTreeSet<String>, String> {
+pub fn names_at(available: &Path, active: &Path) -> Result<Vec<String>, String> {
     let mut names = BTreeSet::new();
     for dir in [available, active] {
-        match fs::metadata(dir) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("{}: {error}", dir.display())),
-        }
-        let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
-            if let Some(name) = entry.file_name().to_str() {
-                if validate_name("status", Some(name)).is_ok() {
-                    match entry.metadata() {
-                        Ok(metadata) if metadata.is_dir() => {
+        match fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    if let Some(name) = entry
+                        .file_name()
+                        .to_str()
+                        .filter(|s| crate::valid_name(s) && !s.starts_with('.'))
+                    {
+                        if entry.path().is_dir() || entry.path().is_symlink() {
                             names.insert(name.to_string());
-                        }
-                        Ok(_) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            return Err(format!("{}: {error}", entry.path().display()));
                         }
                     }
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
         }
     }
-    Ok(names)
-}
-
-/// One entry of `list()`'s mapping, factored out so a single-service refresh (selecting a row)
-/// can look up just that one service without re-querying every other one.
-fn service_status(scope: Scope, active: &Path, name: String) -> Service {
-    let target = active.join(&name);
-    if !exists(&target) {
-        return Service {
-            name,
-            state: "Disabled".into(),
-            summary: "Available, not enabled".into(),
-        };
+    if !available.is_dir() && !active.is_dir() {
+        return Err("No system runit service directories found".into());
     }
-    match crate::Backend::Runit.request(scope, "status", Some(&name)) {
-        Ok(text) => service_from_status(name, &text),
-        Err(error) => Service {
-            name,
-            state: "Unknown".into(),
-            summary: format!("Status unavailable: {error}"),
-        },
-    }
+    Ok(names.into_iter().collect())
 }
-
-pub(crate) fn service_from_status(name: String, text: &str) -> Service {
-    let state = if text.starts_with("Disabled:") {
-        "Disabled"
+pub fn from_status(name: String, text: &str) -> Service {
+    let main = text.split(';').next().unwrap_or(text);
+    let state = if main.starts_with("Available:") {
+        "Available"
+    } else if main.contains(", paused") {
+        "Paused"
+    } else if main.starts_with("run:") {
+        "Started"
+    } else if main.starts_with("down:") {
+        "Stopped"
+    } else if main.starts_with("finish:") {
+        "Finishing"
     } else {
-        state_for_status(text)
+        "Unknown"
     };
     Service {
         name,
@@ -271,237 +61,346 @@ pub(crate) fn service_from_status(name: String, text: &str) -> Service {
         summary: text.trim().into(),
     }
 }
-
-/// Refreshes a single service's live state directly (one `sv status`), instead of `list()`'s
-/// full directory scan — for when the GUI only needs to update the one row the user selected.
-pub fn service(scope: Scope, name: &str) -> Result<Service, String> {
-    validate_name("status", Some(name))?;
-    let (_, active) = dirs(scope)?;
-    Ok(service_status(scope, &active, name.to_owned()))
+pub fn snapshot() -> Result<Snapshot, String> {
+    let names = names_at(Path::new(AVAILABLE), Path::new(ACTIVE))?;
+    let mut access = Access::Connected;
+    let services = names
+        .into_iter()
+        .map(|name| {
+            // One permission failure means every supervise directory is closed to this user;
+            // do not fork sv for each remaining service.
+            if access == Access::AuthenticationRequired && exists(&Path::new(ACTIVE).join(&name)) {
+                return Service {
+                    name,
+                    state: "Unknown".into(),
+                    summary: "Live status locked · definition available".into(),
+                };
+            }
+            match request("status", Some(&name)) {
+                Ok(text) => from_status(name, &text),
+                Err(e) => {
+                    if crate::permission_error(&e) {
+                        access = Access::AuthenticationRequired;
+                    }
+                    Service {
+                        name,
+                        state: "Unknown".into(),
+                        summary: format!("Supervisor status unavailable: {e}"),
+                    }
+                }
+            }
+        })
+        .collect();
+    Ok(Snapshot { services, access })
 }
-
-pub fn request(scope: Scope, action: &str, service: Option<&str>) -> Result<String, String> {
-    validate(action, service)?;
-    let name = service.ok_or("Select a service")?;
-    let (available, active) = dirs(scope)?;
-    request_at(&available, &active, action, name)
+/// A single helper round trip for the whole snapshot, including status failures per record.
+pub fn snapshot_text() -> Result<String, String> {
+    Ok(snapshot()?
+        .services
+        .into_iter()
+        .map(|s| {
+            format!(
+                "{}\t{}\t{}",
+                s.name,
+                s.state,
+                s.summary.replace(['\n', '\r', '\t'], " ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
-
-fn request_at(available: &Path, active: &Path, action: &str, name: &str) -> Result<String, String> {
-    validate(action, Some(name))?;
+pub fn parse_snapshot(text: &str) -> Vec<Service> {
+    text.lines()
+        .filter_map(|l| {
+            let mut fields = l.splitn(3, '\t');
+            let name = fields.next()?;
+            validate_name(name).ok()?;
+            Some(Service {
+                name: name.into(),
+                state: fields.next()?.into(),
+                summary: fields.next()?.into(),
+            })
+        })
+        .collect()
+}
+pub fn definition(name: &str) -> Option<PathBuf> {
+    validate_name(name).ok()?;
+    let available = Path::new(AVAILABLE).join(name);
+    if available.is_dir() {
+        Some(available)
+    } else {
+        let active = Path::new(ACTIVE).join(name);
+        active.is_dir().then_some(active)
+    }
+}
+/// Recognize only literal svlogd destinations; never evaluate shell expressions.
+pub fn log_path(name: &str) -> Option<PathBuf> {
+    let text = fs::read_to_string(definition(name)?.join("log/run")).ok()?;
+    text.lines().find_map(|line| {
+        if line.trim().starts_with('#') {
+            return None;
+        }
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        let program = tokens
+            .iter()
+            .position(|t| matches!(*t, "svlogd" | "/usr/bin/svlogd"))?;
+        if program != 0 && !(program == 1 && tokens[0] == "exec") {
+            return None;
+        }
+        let candidates = tokens[program + 1..]
+            .iter()
+            .filter(|t| !t.starts_with('-'))
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return None;
+        }
+        let path = candidates[0].trim_matches(['\'', '"']);
+        if !path.starts_with("/var/log/")
+            || !path
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/_-.".contains(c))
+        {
+            return None;
+        }
+        Some(PathBuf::from(path).join("current"))
+    })
+}
+pub fn sv_command(action: Action, path: &Path) -> Result<Command, String> {
+    if !action.supported(crate::Backend::Runit) {
+        return Err("Unsupported runit action".into());
+    }
+    let control = match action {
+        Action::Start => "start",
+        Action::Stop => "stop",
+        Action::Restart => "restart",
+        Action::Reload => "reload",
+        Action::Once => "once",
+        Action::Pause => "pause",
+        Action::Continue => "cont",
+        Action::Hup => "hup",
+        Action::Alarm => "alarm",
+        Action::Interrupt => "interrupt",
+        Action::Quit => "quit",
+        Action::User1 => "1",
+        Action::User2 => "2",
+        Action::Terminate => "term",
+        Action::Kill => "kill",
+        Action::Check => "check",
+        Action::ForceStop => "force-stop",
+        Action::ForceRestart => "force-restart",
+        _ => return Err("This action changes service links, not supervisor state".into()),
+    };
+    let mut cmd = Command::new("/usr/bin/sv");
+    cmd.args(["-w", "7", control]).arg(path).env("LC_ALL", "C");
+    Ok(cmd)
+}
+pub fn request(action: &str, name: Option<&str>) -> Result<String, String> {
+    let name = name.ok_or("Select a service")?;
+    validate_name(name)?;
+    if action != "status" {
+        return execute(action.parse()?, name);
+    }
+    let path = Path::new(ACTIVE).join(name);
+    if !exists(&path) {
+        return Ok(format!(
+            "Available: {name} is not linked into the active runsvdir"
+        ));
+    }
+    let mut cmd = Command::new("/usr/bin/sv");
+    cmd.arg("status").arg(path).env("LC_ALL", "C");
+    output(cmd)
+}
+/// Void selects the runlevel by pointing /var/service at /etc/runit/runsvdir/<level>.
+pub fn runlevel() -> Option<String> {
+    fs::canonicalize(ACTIVE)
+        .ok()?
+        .file_name()?
+        .to_str()
+        .map(Into::into)
+}
+pub fn execute(action: Action, name: &str) -> Result<String, String> {
+    let mut text = execute_at(Path::new(AVAILABLE), Path::new(ACTIVE), action, name)?;
+    if matches!(action, Action::Enable | Action::Disable) {
+        if let Some(level) = runlevel().filter(|l| l != "default") {
+            text.push_str(&format!(
+                " This changed the active runlevel ({level}); boot uses default, which is unchanged."
+            ));
+        }
+    }
+    Ok(text)
+}
+pub fn execute_at(
+    available: &Path,
+    active: &Path,
+    action: Action,
+    name: &str,
+) -> Result<String, String> {
+    validate_name(name)?;
     let source = available.join(name);
     let target = active.join(name);
     match action {
-        "enable" => {
+        Action::Enable => {
             if !source.join("run").is_file() {
-                return Err(format!(
-                    "Missing run script: {}",
-                    source.join("run").display()
-                ));
+                return Err("Definition has no run script".into());
             }
             if exists(&target) {
-                return Err(format!("Already enabled: {}", target.display()));
+                return Err("Service is already linked; refusing to overwrite".into());
             }
-            let parent = target.parent().ok_or("Invalid service directory")?;
-            if !parent.is_dir() {
-                return Err(format!("No active runit directory: {} (start a user runsvdir first if this is a user service)", parent.display()));
-            }
-            symlink(&source, &target).map_err(|e| format!("{}: {e}", target.display()))?;
-            Ok(format!("Enabled {name} at {}", target.display()))
-        }
-        "disable" => {
-            if !exists(&target) {
-                return Err(format!("Not enabled: {name}"));
-            }
-            let same_source = match (fs::canonicalize(&target), fs::canonicalize(&source)) {
-                (Ok(actual), Ok(expected)) => actual == expected,
-                _ => false,
-            };
-            if !target.is_symlink() || !same_source {
-                return Err(format!(
-                    "Refusing to remove {}: it is not a link to {}",
-                    target.display(),
-                    source.display()
-                ));
-            }
-            fs::remove_file(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+            symlink(&source, &target).map_err(|e| e.to_string())?;
             Ok(format!(
-                "Disabled {name}; runsvdir will stop supervising it"
+                "Enabled {name}; runsvdir will discover it on its next scan"
+            ))
+        }
+        Action::Disable => {
+            if !target.is_symlink()
+                || fs::canonicalize(&target)
+                    .ok()
+                    .zip(fs::canonicalize(&source).ok())
+                    .is_none_or(|(a, b)| a != b)
+            {
+                return Err("Refusing to remove a service entry that is not a link to its available definition".into());
+            }
+            fs::remove_file(target).map_err(|e| e.to_string())?;
+            Ok(format!(
+                "Disabled {name}; runsvdir will retire supervision on its next scan"
             ))
         }
         _ => {
-            if !exists(&target) {
-                if action == "status" {
-                    return Ok(format!("Disabled: {name} is not supervised by runit"));
-                }
-                return Err(format!(
-                    "{name} is not enabled in {}",
-                    target.parent().unwrap().display()
-                ));
+            if !target.is_dir() {
+                return Err("This service is not supervised in the active runsvdir".into());
             }
-            let sv_action = match action {
-                "status" => "status",
-                "start" => "up",
-                "stop" => "down",
-                "restart" => "restart",
-                "reload" => "hup",
-                _ => unreachable!(),
-            };
-            let mut cmd = Command::new("/usr/bin/sv");
-            cmd.arg(sv_action).arg(&target).env("LC_ALL", "C");
-            output(cmd)
+            output(sv_command(action, &target)?)
         }
     }
 }
-
+pub fn inspect(name: &str) -> Result<Inspection, String> {
+    validate_name(name)?;
+    let dir = definition(name).ok_or("No readable system service directory")?;
+    let active = Path::new(ACTIVE).join(name);
+    let mut facts = vec![
+        ("Definition".into(), dir.display().to_string()),
+        (
+            "Active runsvdir".into(),
+            fs::canonicalize(ACTIVE)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ACTIVE.into()),
+        ),
+        (
+            "Runlevel".into(),
+            runlevel().unwrap_or_else(|| "Unknown".into()),
+        ),
+        (
+            "Supervision link".into(),
+            if exists(&active) { "Present" } else { "Absent" }.into(),
+        ),
+        (
+            "Initial state".into(),
+            if dir.join("down").exists() {
+                "Down file present"
+            } else {
+                "Normally up"
+            }
+            .into(),
+        ),
+        (
+            "Readiness".into(),
+            if dir.join("check").is_file() {
+                "Check script available"
+            } else {
+                "No check script; process state only"
+            }
+            .into(),
+        ),
+    ];
+    let mut definition = String::new();
+    let mut components = String::new();
+    for name in [
+        "run",
+        "finish",
+        "check",
+        "conf",
+        "down",
+        "log/run",
+        "log/config",
+    ] {
+        let path = dir.join(name);
+        if exists(&path) {
+            components.push_str(&format!("{name}  {}\n", path.display()));
+            if path.is_file() {
+                match fs::read_to_string(&path) {
+                    Ok(text) => definition.push_str(&format!("# ── {name} ──\n{text}\n")),
+                    Err(e) => definition.push_str(&format!("# {name}: {e}\n")),
+                }
+            }
+        }
+    }
+    if let Ok(entries) = dir.join("control").read_dir() {
+        for e in entries.flatten() {
+            components.push_str(&format!("control/{}\n", e.file_name().to_string_lossy()));
+        }
+    }
+    let log = dir.join("log").is_dir();
+    facts.push((
+        "Log supervisor".into(),
+        if log {
+            "Appendant log service present; sv status includes its independent state"
+        } else {
+            "No appendant log service"
+        }
+        .into(),
+    ));
+    components.push_str("\nRunit has no authoritative dependency graph. Scripts and control hooks define service relationships.\nThe down file controls initial state; it does not determine whether the service is currently running.");
+    Ok(Inspection{name:name.into(),facts,definition,relations:components,diagnostics:String::new(),log_available:log_path(name).is_some(),
+        log_description:if log {"The appendant log service has its own supervisor state, shown under Diagnostics. Review log/run for the output destination; shell scripts may compute it dynamically."}else{"No appendant log service. Output may be redirected by the run script or a system logger."}.into()})
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Guards the two tests below that mutate the process-wide `HOME` env var — same reasoning
-    /// as lib.rs's `XDG_CONFIG_HOME_LOCK`.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
-    fn state_for_status_covers_base_and_paused() {
-        assert_eq!(state_for_status("run: dbus: (pid 123) 10s"), "Started");
+    fn main_and_log_states_are_independent() {
         assert_eq!(
-            state_for_status("down: dbus: 5s, normally up, want up"),
-            "Stopped"
+            from_status(
+                "demo".into(),
+                "run: demo: (pid 12) 8s; down: log: 3s, paused"
+            )
+            .state,
+            "Started"
         );
-        assert_eq!(state_for_status("finish: dbus: (pid 123) 0s"), "Finishing");
         assert_eq!(
-            state_for_status("run: dbus: (pid 123) 10s, paused"),
+            from_status(
+                "demo".into(),
+                "run: demo: (pid 12) 8s, paused; run: log: (pid 13) 9s"
+            )
+            .state,
             "Paused"
         );
-        assert_eq!(state_for_status("unexpected text"), "Unknown");
         assert_eq!(
-            service_from_status("dbus".into(), "Disabled: dbus is not supervised by runit").state,
-            "Disabled"
+            from_status("demo".into(), "finish: demo: (pid 12) 0s, want down").state,
+            "Finishing"
+        );
+        assert_eq!(
+            from_status("demo".into(), "warning: unable to open supervise/ok").state,
+            "Unknown"
         );
     }
     #[test]
-    fn only_expected_actions_and_names() {
-        assert!(validate("start", Some("dbus")).is_ok());
-        assert!(validate("catlog", Some("dbus")).is_err());
-        assert!(validate("stop", Some("../etc/passwd")).is_err());
-        assert_eq!(
-            render_run_file("/usr/bin/demo --flag").unwrap(),
-            "#!/bin/sh\nexec /usr/bin/demo --flag\n"
-        );
-        assert!(render_run_file("echo ok\nrm -rf /tmp").is_err());
-    }
-
-    #[test]
-    fn service_names_merges_live_links_and_available_definitions() {
-        let base = std::env::temp_dir().join(format!("pilot-runit-list-{}", std::process::id()));
-        let available = base.join("sv");
-        let active = base.join("service");
-        fs::create_dir_all(available.join("dbus")).unwrap();
-        fs::create_dir_all(active.join("orphan")).unwrap();
-        symlink(available.join("dbus"), active.join("dbus")).unwrap();
-        fs::write(active.join("not-a-service"), "ignored").unwrap();
-
-        assert_eq!(
-            service_names(&available, &active).unwrap(),
-            BTreeSet::from(["dbus".to_string(), "orphan".to_string()])
-        );
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn enable_disable_only_removes_its_own_link() {
-        let base = std::env::temp_dir().join(format!("pilot-runit-{}", std::process::id()));
-        let available = base.join("sv");
-        let active = base.join("service");
+    fn links_and_live_only_directories_are_discovered_safely() {
+        let root = std::env::temp_dir().join(format!("pilot-runit-links-{}", std::process::id()));
+        let available = root.join("sv");
+        let active = root.join("service");
         fs::create_dir_all(available.join("worker")).unwrap();
-        fs::create_dir_all(&active).unwrap();
-        fs::write(available.join("worker/run"), "#!/bin/sh\nexit 0\n").unwrap();
-        request_at(&available, &active, "enable", "worker").unwrap();
-        assert_eq!(
-            fs::canonicalize(active.join("worker")).unwrap(),
-            fs::canonicalize(available.join("worker")).unwrap()
-        );
-        assert!(request_at(&available, &active, "enable", "worker").is_err());
+        fs::create_dir_all(available.join(".pilot-stage-hidden")).unwrap();
+        fs::create_dir_all(active.join("live")).unwrap();
+        fs::write(available.join("worker/run"), "#!/bin/sh\n").unwrap();
+        execute_at(&available, &active, Action::Enable, "worker").unwrap();
+        assert_eq!(names_at(&available, &active).unwrap(), ["live", "worker"]);
+        assert!(execute_at(&available, &active, Action::Enable, "worker").is_err());
         fs::remove_file(active.join("worker")).unwrap();
         symlink("/etc", active.join("worker")).unwrap();
-        assert!(request_at(&available, &active, "disable", "worker").is_err());
-        assert!(exists(&active.join("worker")));
+        assert!(execute_at(&available, &active, Action::Disable, "worker").is_err());
         fs::remove_file(active.join("worker")).unwrap();
         symlink(available.join("worker"), active.join("worker")).unwrap();
-        request_at(&available, &active, "disable", "worker").unwrap();
-        assert!(!exists(&active.join("worker")));
-        fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn user_service_requires_disable_before_delete() {
-        let base = std::env::temp_dir().join(format!("pilot-runit-create-{}", std::process::id()));
-        let available = base.join("sv");
-        let active = base.join("service");
-        fs::create_dir_all(&active).unwrap();
-        let contents = render_run_file("/bin/sleep 1").unwrap();
-        let path = create_user_service_at(&available, "worker", &contents, &[]).unwrap();
-        assert_eq!(fs::read_to_string(path.join("run")).unwrap(), contents);
-        assert!(fs::metadata(path.join("run")).unwrap().permissions().mode() & 0o111 != 0);
-        request_at(&available, &active, "enable", "worker").unwrap();
-        assert!(delete_user_service_at(&available, &active, "worker").is_err());
-        request_at(&available, &active, "disable", "worker").unwrap();
-        delete_user_service_at(&available, &active, "worker").unwrap();
-        assert!(!path.exists());
-        fs::remove_dir_all(base).unwrap();
-    }
-    #[test]
-    fn set_down_creates_and_removes_the_down_file() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let base = std::env::temp_dir().join(format!("pilot-runit-down-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        unsafe { std::env::set_var("HOME", &base) };
-
-        let contents = render_run_file("/bin/sleep infinity").unwrap();
-        create_user_service("worker", &contents, &[]).unwrap();
-        let down_path = base.join(".local/share/sv/worker/down");
-        assert!(!down_path.exists());
-
-        set_down("worker", true).unwrap();
-        assert!(down_path.exists());
-        set_down("worker", true).unwrap(); // idempotent
-        assert!(down_path.exists());
-
-        set_down("worker", false).unwrap();
-        assert!(!down_path.exists());
-        set_down("worker", false).unwrap(); // idempotent when already absent
-
-        unsafe { std::env::remove_var("HOME") };
-        fs::remove_dir_all(base).unwrap();
-    }
-    #[test]
-    fn service_looks_up_one_entry_without_listing_the_rest() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let base = std::env::temp_dir().join(format!("pilot-runit-service-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        unsafe { std::env::set_var("HOME", &base) };
-
-        let contents = render_run_file("/bin/sleep infinity").unwrap();
-        create_user_service("worker", &contents, &[]).unwrap();
-        let disabled = service(Scope::User, "worker").unwrap();
-        assert_eq!(disabled.state, "Disabled");
-
-        let (available, active) = dirs(Scope::User).unwrap();
-        fs::create_dir_all(&active).unwrap();
-        request_at(&available, &active, "enable", "worker").unwrap();
-        // No real runsv is supervising this directory, so `sv status` itself fails — still a
-        // real, deterministic answer from `service()`, not a listing of every other service.
-        let enabled = service(Scope::User, "worker").unwrap();
-        assert_eq!(enabled.state, "Unknown");
-        assert!(enabled.summary.starts_with("Status unavailable:"));
-
-        assert!(service(Scope::User, "../etc/passwd").is_err());
-
-        unsafe { std::env::remove_var("HOME") };
-        fs::remove_dir_all(base).unwrap();
+        execute_at(&available, &active, Action::Disable, "worker").unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }

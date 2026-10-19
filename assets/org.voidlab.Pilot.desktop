@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=Pilot
-Comment=Manage dinit and runit services
+Comment=Inspect and manage system dinit and runit services
 Exec=pilot
 Icon=org.voidlab.Pilot
 Terminal=false

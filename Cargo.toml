@@ -3,7 +3,7 @@ name = "pilot"
 version = "0.1.2"
 edition = "2021"
 license = "MIT"
-description = "GTK4 service manager for dinit and runit"
+description = "GTK4 system service manager for dinit and runit"
 default-run = "pilot"
 
 [features]
