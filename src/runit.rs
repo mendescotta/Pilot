@@ -185,6 +185,17 @@ fn delete_user_service_at(available: &Path, active: &Path, name: &str) -> Result
 }
 
 pub fn list(scope: Scope) -> Result<Vec<Service>, String> {
+    let (_, active) = dirs(scope)?;
+    Ok(list_names(scope)?
+        .into_iter()
+        .map(|name| service_status(scope, &active, name))
+        .collect())
+}
+
+/// Lists service names without querying supervisor state. This is also the first, low-cost
+/// request used by Pilot's authenticated system refresh; status is then fetched through the
+/// privileged helper so runit's root-owned supervise sockets are readable.
+pub fn list_names(scope: Scope) -> Result<Vec<String>, String> {
     let (available, active) = dirs(scope)?;
     if !available.is_dir() && !active.is_dir() {
         return Err(format!(
@@ -193,10 +204,7 @@ pub fn list(scope: Scope) -> Result<Vec<Service>, String> {
             active.display()
         ));
     }
-    Ok(service_names(&available, &active)?
-        .into_iter()
-        .map(|name| service_status(scope, &active, name))
-        .collect())
+    Ok(service_names(&available, &active)?.into_iter().collect())
 }
 
 fn service_names(available: &Path, active: &Path) -> Result<BTreeSet<String>, String> {
@@ -242,16 +250,25 @@ fn service_status(scope: Scope, active: &Path, name: String) -> Service {
         };
     }
     match crate::Backend::Runit.request(scope, "status", Some(&name)) {
-        Ok(text) => Service {
-            name,
-            state: state_for_status(&text).into(),
-            summary: text.trim().into(),
-        },
+        Ok(text) => service_from_status(name, &text),
         Err(error) => Service {
             name,
             state: "Unknown".into(),
             summary: format!("Status unavailable: {error}"),
         },
+    }
+}
+
+pub(crate) fn service_from_status(name: String, text: &str) -> Service {
+    let state = if text.starts_with("Disabled:") {
+        "Disabled"
+    } else {
+        state_for_status(text)
+    };
+    Service {
+        name,
+        state: state.into(),
+        summary: text.trim().into(),
     }
 }
 
@@ -359,6 +376,10 @@ mod tests {
             "Paused"
         );
         assert_eq!(state_for_status("unexpected text"), "Unknown");
+        assert_eq!(
+            service_from_status("dbus".into(), "Disabled: dbus is not supervised by runit").state,
+            "Disabled"
+        );
     }
     #[test]
     fn only_expected_actions_and_names() {

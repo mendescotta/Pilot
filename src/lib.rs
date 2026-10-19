@@ -93,6 +93,43 @@ impl Backend {
         }
     }
 
+    /// Refreshes runit system service status through the privileged helper. Runit's supervise
+    /// sockets are root-owned on Void, so an unprivileged `sv status` only reports access
+    /// denied. The GUI calls this only from its explicit Refresh button; startup discovery stays
+    /// unprivileged and can still show service definitions immediately.
+    pub fn list_privileged(self, scope: Scope) -> Result<Vec<Service>, String> {
+        if self != Self::Runit || scope != Scope::System {
+            return self.list(scope);
+        }
+        let names = privileged_request(self, "list", &[])?;
+        names
+            .lines()
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                runit::validate("status", Some(name))?;
+                Ok(match privileged_request(self, "status", &[name]) {
+                    Ok(text) => runit::service_from_status(name.to_owned(), &text),
+                    Err(error) => Service {
+                        name: name.to_owned(),
+                        state: "Unknown".into(),
+                        summary: format!("Status unavailable: {error}"),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Uses the current helper session when one is already authorized, but never starts a new
+    /// authentication flow. This keeps post-action and selected-service refreshes accurate
+    /// after the user explicitly authenticates with the toolbar Refresh button.
+    pub fn list_with_session(self, scope: Scope) -> Result<Vec<Service>, String> {
+        if self == Self::Runit && scope == Scope::System && helper_session_is_active() {
+            self.list_privileged(scope)
+        } else {
+            self.list(scope)
+        }
+    }
+
     /// Refreshes a single service's live state — for the GUI to update just the row the user
     /// selected, instead of the whole list. Runit has a real per-service primitive (`sv
     /// status`) and uses that directly. Dinit's control protocol doesn't: `status`'s free-text
@@ -107,6 +144,10 @@ impl Backend {
                 .into_iter()
                 .find(|s| s.name == name)
                 .ok_or_else(|| format!("{name}: no longer listed")),
+            Self::Runit if scope == Scope::System && helper_session_is_active() => {
+                let text = privileged_request(self, "status", &[name])?;
+                Ok(runit::service_from_status(name.to_owned(), &text))
+            }
             Self::Runit => runit::service(scope, name),
         }
     }
@@ -122,7 +163,8 @@ impl Backend {
             Self::Runit => {
                 runit::validate(action, service)?;
                 let args: Vec<&str> = service.into_iter().collect();
-                if scope == Scope::System && action != "status" {
+                // Status reuses an already authorized helper session but never starts one.
+                if scope == Scope::System && (action != "status" || helper_session_is_active()) {
                     privileged_request(self, action, &args)
                 } else {
                     // Listing and status are read-only and must never trigger authentication.
@@ -168,6 +210,9 @@ impl Backend {
                 _ => command(Scope::System, action, args.first().copied()).and_then(output),
             },
             Self::Runit => {
+                if action == "list" && args.is_empty() {
+                    return runit::list_names(Scope::System).map(|names| names.join("\n"));
+                }
                 if args.len() > 1 {
                     return Err(format!("{action} is not supported for runit"));
                 }
@@ -525,6 +570,14 @@ struct HelperSession {
 
 static HELPER: Mutex<Option<HelperSession>> = Mutex::new(None);
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
+
+fn helper_session_is_active() -> bool {
+    HELPER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|session| Instant::now() < session.deadline)
+}
 
 /// Polls once a second for the named session to go idle past `IDLE_TIMEOUT` and drops it when it
 /// does, so an unused root process doesn't linger forever. Exits without acting the moment `id`

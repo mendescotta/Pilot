@@ -277,10 +277,18 @@ impl Ui {
         self.status_filter.set_selected(index as u32);
     }
     fn refresh(&self) {
+        self.refresh_with_privilege(false);
+    }
+    fn refresh_with_privilege(&self, privileged: bool) {
         let scope = self.scope();
         let backend = self.backend();
         let work = move || {
-            if backend == Backend::Dinit {
+            // Only runit needs the helper to read status; dinit keeps its discovery warning.
+            if privileged && backend == Backend::Runit {
+                backend
+                    .list_privileged(scope)
+                    .map(|services| (services, None))
+            } else if backend == Backend::Dinit {
                 let listing = pilot::request(scope, "list", None);
                 let services = pilot::discover(
                     scope,
@@ -292,7 +300,9 @@ impl Ui {
                     Err(error) => Err(error),
                 }
             } else {
-                backend.list(scope).map(|services| (services, None))
+                backend
+                    .list_with_session(scope)
+                    .map(|services| (services, None))
             }
         };
         let done = move |ui: &Ui, (services, warning): (Vec<Service>, Option<String>)| {
@@ -1258,7 +1268,7 @@ fn build(app: &gtk::Application, system_backend: Backend, user_backend: Backend)
     };
     ui.apply_backend_dependent_ui();
     let clone = ui.clone();
-    refresh.connect_clicked(move |_| clone.refresh());
+    refresh.connect_clicked(move |_| clone.refresh_with_privilege(true));
     let clone = ui.clone();
     environment_btn.connect_clicked(move |_| clone.show_environment_dialog());
     let clone = ui.clone();

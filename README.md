@@ -39,6 +39,8 @@ For dinit, a running user instance handles User-scope operations — on Void tha
 
 Pilot lists available definitions in `/etc/sv` and enabled services in `/var/service`, using `/usr/bin/sv` for lifecycle actions; enable links `/var/service/<name>` to `/etc/sv/<name>`, and disable removes only a link that points there. For user scope, Pilot uses `~/.local/share/sv` for definitions and `~/.local/service` for active links, matching QRunSvMgr's conventions — a user `runsvdir` must already supervise `~/.local/service`.
 
+On runit system scope, startup discovery lists services without authentication. Use the toolbar Refresh button to authenticate through `pkexec` and load live status from the root-owned supervise sockets.
+
 The Add form writes a previewed executable `run` script, optionally with a `down` file so the service exists but won't start automatically until started manually. `sv status`'s own text already distinguishes more than Started/Stopped — Pilot surfaces `finish:` (the finish script is running) as its own state, and promotes `, paused` (SIGSTOP'd) over the base state.
 
 ## Dinit
