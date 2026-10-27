@@ -1,0 +1,16 @@
+{
+  "name": "pilot Rust development",
+  "image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config libgtk-4-dev",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  },
+  "remoteUser": "vscode"
+}
